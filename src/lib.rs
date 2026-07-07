@@ -26,7 +26,10 @@
 //! |---------|--------|
 //! | `serde` | derives `Serialize` / `Deserialize` on [`Samples`] as a JSON array of f32 |
 
+#![feature(portable_simd)]
 #![deny(missing_docs, unreachable_pub)]
+
+use std::simd::{f32x8, i16x8, prelude::*};
 
 use std::ops::Deref;
 
@@ -77,14 +80,57 @@ impl Samples {
         }
     }
 
-    /// Convert to L16 mono PCM (i16 little-endian bytes) by clamping each
-    /// sample to [-1.0, 1.0] and scaling to the i16 range.
+    /// Convert to L16 mono PCM (i16 little-endian bytes) using SIMD.
     pub fn to_pcm(&self) -> PCM {
-        let bytes: Vec<u8> = self
-            .0
-            .iter()
-            .flat_map(|&s| sample_to_i16(s).to_le_bytes())
-            .collect();
+        let chunks = self.0.chunks_exact(8);
+        let remainder = chunks.remainder();
+
+        // Allocate space ahead of time to eliminate reallocation overhead
+        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+
+        // 1. Process main data in 8-sample SIMD vector lanes
+        for chunk in chunks {
+            let sample_vec = f32x8::from_slice(chunk);
+
+            // Clamp to [-1.0, 1.0]
+            let clamped = sample_vec.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
+
+            // Select scaling factor based on the sign of each lane
+            let is_positive = clamped.simd_ge(f32x8::splat(0.0));
+            let scale = is_positive.select(
+                f32x8::splat(i16::MAX as f32),
+                f32x8::splat(-(i16::MIN as f32)),
+            );
+
+            // Scale and cast directly to i16
+            let scaled = clamped * scale;
+            let ints: i16x8 = scaled.cast();
+
+            // Copy the raw system-endian bytes to our output buffer
+            let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
+            bytes.extend_from_slice(&byte_array);
+        }
+
+        // 2. Process remaining samples (less than 8) sequentially
+        for &s in remainder {
+            let clamped = s.clamp(-1.0, 1.0);
+            let scale = if clamped >= 0.0 {
+                i16::MAX as f32
+            } else {
+                -(i16::MIN as f32)
+            };
+            let scaled = (clamped * scale) as i16;
+            bytes.extend_from_slice(&scaled.to_le_bytes());
+        }
+
+        // 3. Adjust byte order for big-endian target architectures
+        #[cfg(target_endian = "big")]
+        {
+            for chunk in bytes.chunks_exact_mut(2) {
+                chunk.swap(0, 1);
+            }
+        }
+
         PCM::from(bytes)
     }
 }
@@ -327,5 +373,39 @@ mod tests {
         let serialized = serde_json::to_string(&s).unwrap();
         let deserialized: Samples = serde_json::from_str(&serialized).unwrap();
         assert_eq!(s, deserialized);
+    }
+
+    #[test]
+    fn test_to_pcm_correctness() {
+        for len in 0..30 {
+            let mut inputs = vec![];
+            for i in 0..len {
+                let val = match i % 6 {
+                    0 => 0.0,
+                    1 => 0.5,
+                    2 => -0.5,
+                    3 => 1.0,
+                    4 => -1.0,
+                    _ => 1.5 * ((i % 2) as f32 * 2.0 - 1.0),
+                };
+                inputs.push(val);
+            }
+
+            let samples = Samples::from(inputs.clone());
+            let pcm = samples.to_pcm();
+
+            let mut expected_bytes = Vec::with_capacity(len * 2);
+            for &s in &inputs {
+                let val_i16 = sample_to_i16(s);
+                expected_bytes.extend_from_slice(&val_i16.to_le_bytes());
+            }
+
+            assert_eq!(
+                pcm.into_inner(),
+                expected_bytes,
+                "Mismatch at length {}",
+                len
+            );
+        }
     }
 }
