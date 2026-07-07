@@ -30,7 +30,7 @@
 #![feature(portable_simd)]
 #![deny(missing_docs, unreachable_pub)]
 
-use std::simd::{f32x8, i16x8, prelude::*};
+use std::simd::{Select, f32x8, i16x8, prelude::*};
 
 use std::ops::Deref;
 
