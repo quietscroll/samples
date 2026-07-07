@@ -271,16 +271,43 @@ impl IntoIterator for Samples {
     }
 }
 
+fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
+    let chunks = bytes.chunks_exact(16);
+    let remainder = chunks.remainder();
+    let mut floats = Vec::with_capacity(bytes.len() / 2);
+
+    // 1. Process 8 samples (16 bytes) at a time using SIMD
+    for chunk in chunks {
+        let byte_arr: [u8; 16] = chunk.try_into().unwrap();
+        let ints: i16x8 = unsafe { std::mem::transmute(byte_arr) };
+
+        // Adjust endianness if compiled on a big-endian target
+        #[cfg(target_endian = "big")]
+        let ints = ints.swap_bytes();
+
+        let sample_vec: f32x8 = ints.cast();
+        let normalized = sample_vec / f32x8::splat(i16::MAX as f32);
+
+        let mut float_chunk = [0.0f32; 8];
+        normalized.copy_to_slice(&mut float_chunk);
+        floats.extend_from_slice(&float_chunk);
+    }
+
+    // 2. Process remainder (less than 8 samples / 16 bytes) sequentially
+    for chunk in remainder.chunks_exact(2) {
+        let val = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
+        floats.push(val);
+    }
+
+    floats
+}
+
 /// Convert L16 mono PCM bytes to normalized f32 samples.
 ///
 /// Each i16 LE pair is decoded and divided by 32768 to normalize to [-1.0, 1.0].
 impl From<&PCM> for Samples {
     fn from(p: &PCM) -> Self {
-        let floats = p
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
-            .collect();
-        Self(floats)
+        Self(pcm_bytes_to_samples(p.as_ref()))
     }
 }
 
@@ -302,11 +329,7 @@ impl TryFrom<&[u8]> for Samples {
         if bytes.len() % 2 != 0 {
             return Err(Self::Error::ByteLengthNotEven);
         }
-        let floats = bytes
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
-            .collect();
-        Ok(Self(floats))
+        Ok(Self(pcm_bytes_to_samples(bytes)))
     }
 }
 
@@ -376,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_pcm_correctness() {
+    fn test_conversion_correctness() {
         for len in 0..30 {
             let mut inputs = vec![];
             for i in 0..len {
@@ -400,10 +423,33 @@ mod tests {
                 expected_bytes.extend_from_slice(&val_i16.to_le_bytes());
             }
 
+            // Test float-to-PCM correctness (to_pcm SIMD)
             assert_eq!(
-                pcm.into_inner(),
-                expected_bytes,
-                "Mismatch at length {}",
+                pcm.as_ref(),
+                expected_bytes.as_slice(),
+                "Float-to-PCM mismatch at length {}",
+                len
+            );
+
+            // Test PCM-to-float correctness (From<&PCM> SIMD)
+            let back_from_pcm = Samples::from(&pcm);
+            let expected_floats: Vec<f32> = expected_bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
+                .collect();
+            assert_eq!(
+                back_from_pcm.into_inner(),
+                expected_floats,
+                "PCM-to-float From<&PCM> mismatch at length {}",
+                len
+            );
+
+            // Test PCM-to-float correctness (TryFrom<&[u8]> SIMD)
+            let back_from_bytes = Samples::try_from(expected_bytes.as_slice()).unwrap();
+            assert_eq!(
+                back_from_bytes.into_inner(),
+                expected_floats,
+                "PCM-to-float TryFrom<&[u8]> mismatch at length {}",
                 len
             );
         }
