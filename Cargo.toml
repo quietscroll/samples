@@ -1,0 +1,22 @@
+[package]
+name = "samples"
+version = "0.1.0"
+edition = "2024"
+description = "Normalized f32 audio samples newtype with conversions to and from L16 PCM"
+license = "MIT"
+keywords = ["audio", "samples", "pcm", "dsp", "serde"]
+categories = ["multimedia::audio", "encoding"]
+repository = "https://github.com/ernestas-poskus/quietscroll"
+readme = "README.md"
+
+[dependencies]
+pcm = { git = "https://github.com/quietscroll/pcm" }
+serde = { version = "1", default-features = false, optional = true }
+thiserror = "2"
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+serde_json = { version = "1" }
+
+[features]
+serde = ["dep:serde", "dep:base64"]
