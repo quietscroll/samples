@@ -12,13 +12,14 @@ representation for DSP steps that need f32 arithmetic.
 
 ```rust
 use samples::Samples;
+use pcm::PCM;
 
 // Build from a slice of floats.
 let s = Samples::from(vec![0.0f32, 0.5, -0.5]);
 assert_eq!(s.len(), 3);
 
 // Round-trip to L16 mono PCM and back.
-let pcm = s.to_pcm();
+let pcm = PCM::from(&s);
 let back = Samples::from(&pcm);
 assert_eq!(back.len(), 3);
 assert!((back[1] - 0.5).abs() < 1.0 / i16::MAX as f32 + 1e-6);
@@ -44,7 +45,7 @@ samples = { version = "0.1", features = ["serde"] }
 | `&pcm::PCM` | `Samples` | `From<&PCM>` — i16 LE bytes → normalized f32 |
 | `&[u8]` | `Samples` | `TryFrom<&[u8]>` — rejects odd-length slices |
 | `Samples` | `Vec<f32>` | `From<Samples>` / `into_inner()` |
-| `Samples` | `pcm::PCM` | `to_pcm()` — normalized f32 → i16 LE bytes |
+| `&Samples` / `Samples` | `pcm::PCM` | `From<&Samples>` / `From<Samples>` — normalized f32 → i16 LE bytes |
 
 ## API highlights
 
@@ -54,7 +55,7 @@ samples = { version = "0.1", features = ["serde"] }
 | `Samples::len()` | number of f32 samples |
 | `Samples::is_empty()` | true when the buffer contains no samples |
 | `Samples::trim_tail(n)` | keep only the trailing `n` samples; clone unchanged if shorter |
-| `Samples::to_pcm()` | convert to L16 mono PCM (clamps to `[-1.0, 1.0]`, scales to i16) |
+| `Samples::to_bytes()` | convert to L16 mono PCM bytes (clamps to `[-1.0, 1.0]`, scales to i16 LE) |
 | `Deref<Target = [f32]>` | slice access, iteration, and indexing work directly on `Samples` |
 | `Extend<f32>` | accumulate samples from an iterator |
 | `IntoIterator` | consume as an iterator of `f32` |

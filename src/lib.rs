@@ -8,13 +8,14 @@
 //!
 //! ```
 //! use samples::Samples;
+//! use pcm::PCM;
 //!
 //! // Build from raw floats.
 //! let s = Samples::from(vec![0.0f32, 0.5, -0.5]);
 //! assert_eq!(s.len(), 3);
 //!
 //! // Round-trip to L16 PCM and back.
-//! let pcm = s.to_pcm();
+//! let pcm = PCM::from(&s);
 //! let back = Samples::from(&pcm);
 //! assert_eq!(back.len(), 3);
 //! assert!((back[1] - 0.5).abs() < 1.0 / i16::MAX as f32 + 1e-6);
@@ -80,13 +81,14 @@ impl Samples {
         }
     }
 
-    /// Convert to L16 mono PCM (i16 little-endian bytes) using SIMD.
-    pub fn to_pcm(&self) -> PCM {
+    /// Convert to L16 mono PCM (i16 little-endian bytes) and write the bytes directly to a `Vec<u8>` using SIMD.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+
         let chunks = self.0.chunks_exact(8);
         let remainder = chunks.remainder();
 
-        // Allocate space ahead of time to eliminate reallocation overhead
-        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+        bytes.reserve(self.0.len() * 2);
 
         // 1. Process main data in 8-sample SIMD vector lanes
         for chunk in chunks {
@@ -126,25 +128,14 @@ impl Samples {
         // 3. Adjust byte order for big-endian target architectures
         #[cfg(target_endian = "big")]
         {
-            for chunk in bytes.chunks_exact_mut(2) {
+            let new_bytes_start = bytes.len() - self.0.len() * 2;
+            for chunk in bytes[new_bytes_start..].chunks_exact_mut(2) {
                 chunk.swap(0, 1);
             }
         }
 
-        PCM::from(bytes)
+        bytes
     }
-}
-
-/// Convert a normalized f32 sample to i16, clamping to [-1.0, 1.0] and scaling.
-pub fn sample_to_i16(sample: f32) -> i16 {
-    let clamped = sample.clamp(-1.0, 1.0);
-    let scaled = if clamped >= 0.0 {
-        clamped * i16::MAX as f32
-    } else {
-        clamped * -(i16::MIN as f32)
-    };
-
-    scaled as i16
 }
 
 #[cfg(feature = "serde")]
@@ -311,6 +302,24 @@ impl From<&PCM> for Samples {
     }
 }
 
+impl From<PCM> for Samples {
+    fn from(p: PCM) -> Self {
+        Self::from(&p)
+    }
+}
+
+impl From<&Samples> for PCM {
+    fn from(s: &Samples) -> Self {
+        PCM::from(s.to_bytes())
+    }
+}
+
+impl From<Samples> for PCM {
+    fn from(s: Samples) -> Self {
+        Self::from(&s)
+    }
+}
+
 impl TryFrom<Vec<u8>> for Samples {
     type Error = Error;
 
@@ -343,7 +352,7 @@ mod tests {
         let samples = Samples::from(&one_sec);
         assert_eq!(samples.len(), 24000);
         assert!(samples.iter().all(|&s| s == 0.0));
-        let back = samples.to_pcm();
+        let back = PCM::from(&samples);
         assert_eq!(back.len(), one_sec.len());
     }
 
@@ -398,6 +407,17 @@ mod tests {
         assert_eq!(s, deserialized);
     }
 
+    /// Convert a normalized f32 sample to i16, clamping to [-1.0, 1.0] and scaling.
+    fn sample_to_i16(sample: f32) -> i16 {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let scaled = if clamped >= 0.0 {
+            clamped * i16::MAX as f32
+        } else {
+            clamped * -(i16::MIN as f32)
+        };
+
+        scaled as i16
+    }
     #[test]
     fn test_conversion_correctness() {
         for len in 0..30 {
@@ -415,7 +435,7 @@ mod tests {
             }
 
             let samples = Samples::from(inputs.clone());
-            let pcm = samples.to_pcm();
+            let pcm = PCM::from(&samples);
 
             let mut expected_bytes = Vec::with_capacity(len * 2);
             for &s in &inputs {
@@ -423,7 +443,7 @@ mod tests {
                 expected_bytes.extend_from_slice(&val_i16.to_le_bytes());
             }
 
-            // Test float-to-PCM correctness (to_pcm SIMD)
+            // Test float-to-PCM correctness (From<&Samples> SIMD)
             assert_eq!(
                 pcm.as_ref(),
                 expected_bytes.as_slice(),
@@ -450,6 +470,14 @@ mod tests {
                 back_from_bytes.into_inner(),
                 expected_floats,
                 "PCM-to-float TryFrom<&[u8]> mismatch at length {}",
+                len
+            );
+
+            // Test write_to_pcm_bytes correctness
+            let written_bytes = samples.to_bytes();
+            assert_eq!(
+                written_bytes, expected_bytes,
+                "write_to_pcm_bytes mismatch at length {}",
                 len
             );
         }
