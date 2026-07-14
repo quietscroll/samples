@@ -82,14 +82,33 @@ impl Samples {
     }
 
     /// Convert to L16 mono PCM (i16 little-endian bytes) and write the bytes directly to a `Vec<u8>` using SIMD.
+    #[inline]
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+        self.write_bytes_to(&mut bytes);
+        bytes
+    }
+
+    /// Convert to L16 mono PCM bytes, reusing the provided output buffer.
+    ///
+    /// The buffer is cleared before writing. Conversion semantics are identical
+    /// to [`Samples::to_bytes`]: samples are clamped to `[-1.0, 1.0]`, scaled
+    /// to signed 16-bit little-endian PCM, and written without changing the
+    /// underlying numeric mapping.
+    #[inline]
+    pub fn write_bytes_to(&self, out: &mut Vec<u8>) {
         let sample_count = self.0.len();
+        out.clear();
+
         if sample_count < 8_192 {
-            return self.to_bytes_extend();
+            self.write_bytes_extend_to(out);
+            return;
         }
 
         let byte_len = sample_count * 2;
-        let mut bytes: Vec<u8> = Vec::with_capacity(byte_len);
+        if out.capacity() < byte_len {
+            out.reserve(byte_len - out.capacity());
+        }
         let mut written = 0;
 
         let sample_chunks = self.0.chunks_exact(8);
@@ -112,7 +131,7 @@ impl Samples {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     byte_array.as_ptr(),
-                    bytes.as_mut_ptr().add(written),
+                    out.as_mut_ptr().add(written),
                     byte_array.len(),
                 );
             }
@@ -131,7 +150,7 @@ impl Samples {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     scalar_bytes.as_ptr(),
-                    bytes.as_mut_ptr().add(written),
+                    out.as_mut_ptr().add(written),
                     scalar_bytes.len(),
                 );
             }
@@ -140,22 +159,19 @@ impl Samples {
 
         debug_assert_eq!(written, byte_len);
         unsafe {
-            bytes.set_len(byte_len);
+            out.set_len(byte_len);
         }
 
         #[cfg(target_endian = "big")]
         {
-            for chunk in bytes.chunks_exact_mut(2) {
+            for chunk in out.chunks_exact_mut(2) {
                 chunk.swap(0, 1);
             }
         }
-
-        bytes
     }
 
-    fn to_bytes_extend(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.0.len() * 2);
-
+    #[inline]
+    fn write_bytes_extend_to(&self, out: &mut Vec<u8>) {
         let chunks = self.0.chunks_exact(8);
         let remainder = chunks.remainder();
 
@@ -170,7 +186,7 @@ impl Samples {
 
             let ints: i16x8 = (clamped * scale).cast();
             let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
-            bytes.extend_from_slice(&byte_array);
+            out.extend_from_slice(&byte_array);
         }
 
         for &s in remainder {
@@ -181,17 +197,15 @@ impl Samples {
                 -(i16::MIN as f32)
             };
             let scaled = (clamped * scale) as i16;
-            bytes.extend_from_slice(&scaled.to_le_bytes());
+            out.extend_from_slice(&scaled.to_le_bytes());
         }
 
         #[cfg(target_endian = "big")]
         {
-            for chunk in bytes.chunks_exact_mut(2) {
+            for chunk in out.chunks_exact_mut(2) {
                 chunk.swap(0, 1);
             }
         }
-
-        bytes
     }
 }
 
@@ -319,9 +333,20 @@ impl IntoIterator for Samples {
     }
 }
 
+#[inline]
 fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
+    let mut floats = Vec::with_capacity(bytes.len() / 2);
+    pcm_bytes_to_samples_into(bytes, &mut floats);
+    floats
+}
+
+#[inline]
+fn pcm_bytes_to_samples_into(bytes: &[u8], out: &mut Vec<f32>) {
     let sample_count = bytes.len() / 2;
-    let mut floats: Vec<f32> = Vec::with_capacity(sample_count);
+    out.clear();
+    if out.capacity() < sample_count {
+        out.reserve(sample_count - out.capacity());
+    }
     let mut written = 0;
 
     let byte_chunks = bytes.chunks_exact(16);
@@ -341,7 +366,7 @@ fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 float_chunk.as_ptr(),
-                floats.as_mut_ptr().add(written),
+                out.as_mut_ptr().add(written),
                 float_chunk.len(),
             );
         }
@@ -351,17 +376,15 @@ fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
     for chunk in remainder.chunks_exact(2) {
         let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
         unsafe {
-            std::ptr::write(floats.as_mut_ptr().add(written), sample);
+            std::ptr::write(out.as_mut_ptr().add(written), sample);
         }
         written += 1;
     }
 
     debug_assert_eq!(written, sample_count);
     unsafe {
-        floats.set_len(sample_count);
+        out.set_len(sample_count);
     }
-
-    floats
 }
 
 /// Convert L16 mono PCM bytes to normalized f32 samples.
@@ -410,6 +433,24 @@ impl TryFrom<&[u8]> for Samples {
             return Err(Self::Error::ByteLengthNotEven);
         }
         Ok(Self(pcm_bytes_to_samples(bytes)))
+    }
+}
+
+impl Samples {
+    /// Convert raw i16 LE bytes into a reusable f32 output buffer.
+    ///
+    /// The output buffer is cleared only after the input byte length is
+    /// validated. Conversion semantics are identical to `TryFrom<&[u8]>` for
+    /// [`Samples`], including the exact `i16 as f32 / i16::MAX as f32`
+    /// normalization.
+    #[inline]
+    pub fn try_from_bytes_into(bytes: &[u8], out: &mut Vec<f32>) -> Result<(), Error> {
+        if bytes.len() % 2 != 0 {
+            return Err(Error::ByteLengthNotEven);
+        }
+
+        pcm_bytes_to_samples_into(bytes, out);
+        Ok(())
     }
 }
 
@@ -552,5 +593,44 @@ mod tests {
                 len
             );
         }
+    }
+
+    #[test]
+    fn write_bytes_to_matches_to_bytes_and_reuses_capacity() {
+        let samples = Samples::from(vec![-1.25f32, -1.0, -0.5, 0.0, 0.5, 1.0, 1.25]);
+        let expected = samples.to_bytes();
+        let mut out = Vec::with_capacity(expected.len() * 2);
+        out.extend_from_slice(&[42; 5]);
+        let capacity = out.capacity();
+
+        samples.write_bytes_to(&mut out);
+
+        assert_eq!(out, expected);
+        assert_eq!(out.capacity(), capacity);
+    }
+
+    #[test]
+    fn try_from_bytes_into_matches_try_from_and_reuses_capacity() {
+        let samples = Samples::from(vec![-1.25f32, -1.0, -0.5, 0.0, 0.5, 1.0, 1.25]);
+        let bytes = samples.to_bytes();
+        let expected = Samples::try_from(bytes.as_slice()).unwrap().into_inner();
+        let mut out = Vec::with_capacity(expected.len() * 2);
+        out.extend_from_slice(&[42.0; 5]);
+        let capacity = out.capacity();
+
+        Samples::try_from_bytes_into(bytes.as_slice(), &mut out).unwrap();
+
+        assert_eq!(out, expected);
+        assert_eq!(out.capacity(), capacity);
+    }
+
+    #[test]
+    fn try_from_bytes_into_rejects_odd_byte_lengths() {
+        let mut out = vec![1.0f32, 2.0, 3.0];
+
+        let err = Samples::try_from_bytes_into([0u8, 1, 2].as_slice(), &mut out).unwrap_err();
+
+        assert!(matches!(err, Error::ByteLengthNotEven));
+        assert_eq!(out, vec![1.0f32, 2.0, 3.0]);
     }
 }

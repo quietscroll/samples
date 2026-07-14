@@ -57,12 +57,35 @@ fn bench_conversions(c: &mut Criterion) {
                 });
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("pcm_bytes_to_samples_reuse", sample_count),
+            &pcm_bytes,
+            |b, bytes| {
+                let mut samples = Vec::with_capacity(bytes.len() / 2);
+                b.iter(|| {
+                    Samples::try_from_bytes_into(black_box(bytes.as_slice()), &mut samples)
+                        .expect("benchmark PCM bytes are valid");
+                    black_box(samples.as_slice());
+                });
+            },
+        );
 
         let samples = samples(sample_count);
         group.bench_with_input(
             BenchmarkId::new("to_bytes", sample_count),
             &samples,
             |b, samples| b.iter(|| black_box(samples).to_bytes()),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("to_bytes_reuse", sample_count),
+            &samples,
+            |b, samples| {
+                let mut bytes = Vec::with_capacity(samples.len() * 2);
+                b.iter(|| {
+                    black_box(samples).write_bytes_to(&mut bytes);
+                    black_box(bytes.as_slice());
+                });
+            },
         );
     }
 
