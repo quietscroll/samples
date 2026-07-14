@@ -83,37 +83,96 @@ impl Samples {
 
     /// Convert to L16 mono PCM (i16 little-endian bytes) and write the bytes directly to a `Vec<u8>` using SIMD.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+        let sample_count = self.0.len();
+        if sample_count < 8_192 {
+            return self.to_bytes_extend();
+        }
 
-        let chunks = self.0.chunks_exact(8);
-        let remainder = chunks.remainder();
+        let byte_len = sample_count * 2;
+        let mut bytes: Vec<u8> = Vec::with_capacity(byte_len);
+        let mut written = 0;
 
-        bytes.reserve(self.0.len() * 2);
+        let sample_chunks = self.0.chunks_exact(8);
+        let remainder = sample_chunks.remainder();
 
-        // 1. Process main data in 8-sample SIMD vector lanes
-        for chunk in chunks {
+        for chunk in sample_chunks {
             let sample_vec = f32x8::from_slice(chunk);
 
-            // Clamp to [-1.0, 1.0]
             let clamped = sample_vec.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
 
-            // Select scaling factor based on the sign of each lane
             let is_positive = clamped.simd_ge(f32x8::splat(0.0));
             let scale = is_positive.select(
                 f32x8::splat(i16::MAX as f32),
                 f32x8::splat(-(i16::MIN as f32)),
             );
 
-            // Scale and cast directly to i16
-            let scaled = clamped * scale;
-            let ints: i16x8 = scaled.cast();
+            let ints: i16x8 = (clamped * scale).cast();
 
-            // Copy the raw system-endian bytes to our output buffer
+            let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    byte_array.as_ptr(),
+                    bytes.as_mut_ptr().add(written),
+                    byte_array.len(),
+                );
+            }
+            written += byte_array.len();
+        }
+
+        for &s in remainder {
+            let clamped = s.clamp(-1.0, 1.0);
+            let scale = if clamped >= 0.0 {
+                i16::MAX as f32
+            } else {
+                -(i16::MIN as f32)
+            };
+            let scaled = (clamped * scale) as i16;
+            let scalar_bytes = scaled.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scalar_bytes.as_ptr(),
+                    bytes.as_mut_ptr().add(written),
+                    scalar_bytes.len(),
+                );
+            }
+            written += scalar_bytes.len();
+        }
+
+        debug_assert_eq!(written, byte_len);
+        unsafe {
+            bytes.set_len(byte_len);
+        }
+
+        #[cfg(target_endian = "big")]
+        {
+            for chunk in bytes.chunks_exact_mut(2) {
+                chunk.swap(0, 1);
+            }
+        }
+
+        bytes
+    }
+
+    fn to_bytes_extend(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.0.len() * 2);
+
+        let chunks = self.0.chunks_exact(8);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            let sample_vec = f32x8::from_slice(chunk);
+            let clamped = sample_vec.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
+            let is_positive = clamped.simd_ge(f32x8::splat(0.0));
+            let scale = is_positive.select(
+                f32x8::splat(i16::MAX as f32),
+                f32x8::splat(-(i16::MIN as f32)),
+            );
+
+            let ints: i16x8 = (clamped * scale).cast();
             let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
             bytes.extend_from_slice(&byte_array);
         }
 
-        // 2. Process remaining samples (less than 8) sequentially
         for &s in remainder {
             let clamped = s.clamp(-1.0, 1.0);
             let scale = if clamped >= 0.0 {
@@ -125,11 +184,9 @@ impl Samples {
             bytes.extend_from_slice(&scaled.to_le_bytes());
         }
 
-        // 3. Adjust byte order for big-endian target architectures
         #[cfg(target_endian = "big")]
         {
-            let new_bytes_start = bytes.len() - self.0.len() * 2;
-            for chunk in bytes[new_bytes_start..].chunks_exact_mut(2) {
+            for chunk in bytes.chunks_exact_mut(2) {
                 chunk.swap(0, 1);
             }
         }
@@ -263,31 +320,45 @@ impl IntoIterator for Samples {
 }
 
 fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
-    let chunks = bytes.chunks_exact(16);
-    let remainder = chunks.remainder();
-    let mut floats = Vec::with_capacity(bytes.len() / 2);
+    let sample_count = bytes.len() / 2;
+    let mut floats: Vec<f32> = Vec::with_capacity(sample_count);
+    let mut written = 0;
 
-    // 1. Process 8 samples (16 bytes) at a time using SIMD
-    for chunk in chunks {
+    let byte_chunks = bytes.chunks_exact(16);
+    let remainder = byte_chunks.remainder();
+
+    for chunk in byte_chunks {
         let byte_arr: [u8; 16] = chunk.try_into().unwrap();
         let ints: i16x8 = unsafe { std::mem::transmute(byte_arr) };
 
-        // Adjust endianness if compiled on a big-endian target
         #[cfg(target_endian = "big")]
         let ints = ints.swap_bytes();
 
         let sample_vec: f32x8 = ints.cast();
         let normalized = sample_vec / f32x8::splat(i16::MAX as f32);
-
         let mut float_chunk = [0.0f32; 8];
         normalized.copy_to_slice(&mut float_chunk);
-        floats.extend_from_slice(&float_chunk);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                float_chunk.as_ptr(),
+                floats.as_mut_ptr().add(written),
+                float_chunk.len(),
+            );
+        }
+        written += float_chunk.len();
     }
 
-    // 2. Process remainder (less than 8 samples / 16 bytes) sequentially
     for chunk in remainder.chunks_exact(2) {
-        let val = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
-        floats.push(val);
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
+        unsafe {
+            std::ptr::write(floats.as_mut_ptr().add(written), sample);
+        }
+        written += 1;
+    }
+
+    debug_assert_eq!(written, sample_count);
+    unsafe {
+        floats.set_len(sample_count);
     }
 
     floats
