@@ -30,7 +30,7 @@
 #![feature(portable_simd)]
 #![deny(missing_docs, unreachable_pub)]
 
-use std::simd::{Select, f32x8, i16x8, prelude::*};
+use std::simd::{StdFloat, f32x8, i16x8, prelude::*};
 
 use std::ops::Deref;
 
@@ -81,6 +81,21 @@ impl Samples {
         }
     }
 
+    /// Convert to i16 samples using the same mapping as [`Samples::to_bytes`].
+    ///
+    /// Use this instead of hand-rolled `(s * i16::MAX as f32) as i16` loops so
+    /// every i16 consumer (click detection, crossfades, WAV writers) sees the
+    /// exact values that end up in the delivered PCM.
+    pub fn to_i16_samples(&self) -> Vec<i16> {
+        let (chunks, remainder) = self.0.as_chunks::<8>();
+        let mut out = Vec::with_capacity(self.0.len());
+        for chunk in chunks {
+            out.extend_from_slice(&quantize_x8(f32x8::from_array(*chunk)).to_array());
+        }
+        out.extend(remainder.iter().map(|&s| quantize(s)));
+        out
+    }
+
     /// Convert to L16 mono PCM (i16 little-endian bytes) and write the bytes directly to a `Vec<u8>` using SIMD.
     #[inline]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -117,15 +132,7 @@ impl Samples {
         for chunk in sample_chunks {
             let sample_vec = f32x8::from_slice(chunk);
 
-            let clamped = sample_vec.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
-
-            let is_positive = clamped.simd_ge(f32x8::splat(0.0));
-            let scale = is_positive.select(
-                f32x8::splat(i16::MAX as f32),
-                f32x8::splat(-(i16::MIN as f32)),
-            );
-
-            let ints: i16x8 = (clamped * scale).cast();
+            let ints = quantize_x8(sample_vec);
 
             let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
             unsafe {
@@ -139,13 +146,7 @@ impl Samples {
         }
 
         for &s in remainder {
-            let clamped = s.clamp(-1.0, 1.0);
-            let scale = if clamped >= 0.0 {
-                i16::MAX as f32
-            } else {
-                -(i16::MIN as f32)
-            };
-            let scaled = (clamped * scale) as i16;
+            let scaled = quantize(s);
             let scalar_bytes = scaled.to_le_bytes();
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -177,26 +178,13 @@ impl Samples {
 
         for chunk in chunks {
             let sample_vec = f32x8::from_slice(chunk);
-            let clamped = sample_vec.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
-            let is_positive = clamped.simd_ge(f32x8::splat(0.0));
-            let scale = is_positive.select(
-                f32x8::splat(i16::MAX as f32),
-                f32x8::splat(-(i16::MIN as f32)),
-            );
-
-            let ints: i16x8 = (clamped * scale).cast();
+            let ints = quantize_x8(sample_vec);
             let byte_array: [u8; 16] = unsafe { std::mem::transmute(ints) };
             out.extend_from_slice(&byte_array);
         }
 
         for &s in remainder {
-            let clamped = s.clamp(-1.0, 1.0);
-            let scale = if clamped >= 0.0 {
-                i16::MAX as f32
-            } else {
-                -(i16::MIN as f32)
-            };
-            let scaled = (clamped * scale) as i16;
+            let scaled = quantize(s);
             out.extend_from_slice(&scaled.to_le_bytes());
         }
 
@@ -333,6 +321,23 @@ impl IntoIterator for Samples {
     }
 }
 
+/// Scale a normalized sample to i16: clamp to `[-1.0, 1.0]`, multiply by
+/// `i16::MAX`, round to nearest.
+///
+/// Symmetric scaling by `i16::MAX` with rounding is the exact inverse of the
+/// `i16 / i16::MAX` decode, so PCM → [`Samples`] → PCM is lossless and
+/// repeated round trips through f32 DSP stages never drift.
+#[inline]
+fn quantize(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+}
+
+#[inline]
+fn quantize_x8(v: f32x8) -> i16x8 {
+    let clamped = v.simd_clamp(f32x8::splat(-1.0), f32x8::splat(1.0));
+    (clamped * f32x8::splat(i16::MAX as f32)).round().cast()
+}
+
 #[inline]
 fn pcm_bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
     let mut floats = Vec::with_capacity(bytes.len() / 2);
@@ -411,6 +416,19 @@ impl From<&Samples> for PCM {
 impl From<Samples> for PCM {
     fn from(s: Samples) -> Self {
         Self::from(&s)
+    }
+}
+
+/// Convert i16 samples to normalized f32 using the same `i16 / i16::MAX`
+/// mapping as decoding from [`PCM`].
+impl From<&[i16]> for Samples {
+    fn from(samples: &[i16]) -> Self {
+        Self(
+            samples
+                .iter()
+                .map(|&s| s as f32 / i16::MAX as f32)
+                .collect(),
+        )
     }
 }
 
@@ -521,14 +539,37 @@ mod tests {
 
     /// Convert a normalized f32 sample to i16, clamping to [-1.0, 1.0] and scaling.
     fn sample_to_i16(sample: f32) -> i16 {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let scaled = if clamped >= 0.0 {
-            clamped * i16::MAX as f32
-        } else {
-            clamped * -(i16::MIN as f32)
-        };
+        (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+    }
 
-        scaled as i16
+    /// Every DSP stage decodes PCM to f32 and re-encodes it; a lossy round
+    /// trip would compound quantization error per stage, so it must be exact
+    /// for every representable i16 (except `i16::MIN`, which clamps to -1.0).
+    #[test]
+    fn pcm_round_trip_is_lossless_for_every_i16() {
+        let all: Vec<i16> = ((i16::MIN + 1)..=i16::MAX).collect();
+        let bytes: Vec<u8> = all.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let samples = Samples::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(samples.to_bytes(), bytes);
+        assert_eq!(samples.to_i16_samples(), all);
+        assert_eq!(Samples::from(all.as_slice()), samples);
+    }
+
+    /// `to_i16_samples` must agree with the delivered PCM bytes so i16
+    /// analysis (click detection) measures exactly what listeners hear.
+    #[test]
+    fn to_i16_samples_matches_to_bytes() {
+        let samples = Samples::from(
+            (0..37)
+                .map(|i| (i as f32 * 0.37).sin() * 1.2)
+                .collect::<Vec<f32>>(),
+        );
+        let from_bytes: Vec<i16> = samples
+            .to_bytes()
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(samples.to_i16_samples(), from_bytes);
     }
     #[test]
     fn test_conversion_correctness() {
