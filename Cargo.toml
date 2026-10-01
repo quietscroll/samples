@@ -13,10 +13,10 @@ readme = "README.md"
 pcm = { git = "https://github.com/quietscroll/pcm" }
 serde = { version = "1", default-features = false, optional = true }
 thiserror = "2"
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.7", default-features = false }
+criterion = { version = "0.8", default-features = false }
 serde_json = { version = "1" }
 
 [features]
